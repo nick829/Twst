@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -8,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -147,64 +147,84 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 		_ = conn.Close()
 		return
 	}
+	defer remote.Close()
 
-	var ready sync.WaitGroup
-	ready.Add(2)
+	spawnCtx, cancelSpawn := context.WithCancel(context.Background())
+	defer cancelSpawn()
+	spawnErrors := make(chan error, 2)
 	go func() {
-		defer ready.Done()
-		if err := conn.StartGame(remote.GameData()); err != nil {
-			log.Printf("client start game: %v", err)
-		}
+		spawnErrors <- conn.StartGameContext(spawnCtx, remote.GameData())
 	}()
 	go func() {
-		defer ready.Done()
-		if err := remote.DoSpawn(); err != nil {
-			log.Printf("upstream spawn: %v", err)
-		}
+		spawnErrors <- remote.DoSpawnContext(spawnCtx)
 	}()
-	ready.Wait()
+	for range 2 {
+		if err := <-spawnErrors; err != nil {
+			cancelSpawn()
+			log.Printf("spawn handshake failed for %s: %v", conn.RemoteAddr(), err)
+			_ = listener.Disconnect(conn, "Could not complete the connection to the destination server.")
+			_ = remote.Close()
+			return
+		}
+	}
 
-	done := make(chan struct{}, 2)
+	connectedAt := time.Now()
+	log.Printf("player %s connected from %s; upstream session established", conn.IdentityData().DisplayName, conn.RemoteAddr())
+
+	done := make(chan relayResult, 2)
 	go func() {
-		defer func() { done <- struct{}{} }()
-		defer remote.Close()
-		defer listener.Disconnect(conn, "Connection closed.")
+		var relayErr error
 		for {
 			pk, err := conn.ReadPacket()
 			if err != nil {
-				return
+				relayErr = err
+				break
 			}
 			if err := remote.WritePacket(pk); err != nil {
-				var disc minecraft.DisconnectError
-				if errors.As(err, &disc) {
-					_ = listener.Disconnect(conn, disc.Error())
-				}
-				return
+				relayErr = err
+				break
 			}
 		}
+		done <- relayResult{direction: "client-to-upstream", err: relayErr}
 	}()
 	go func() {
-		defer func() { done <- struct{}{} }()
-		defer conn.Close()
-		defer remote.Close()
+		var relayErr error
 		for {
 			pk, err := remote.ReadPacket()
 			if err != nil {
-				var disc minecraft.DisconnectError
-				if errors.As(err, &disc) {
-					_ = listener.Disconnect(conn, disc.Error())
-				}
-				return
+				relayErr = err
+				break
 			}
 			if err := conn.WritePacket(pk); err != nil {
-				return
+				relayErr = err
+				break
 			}
 		}
+		done <- relayResult{direction: "upstream-to-client", err: relayErr}
 	}()
-	<-done
+
+	result := <-done
+	if result.err != nil {
+		var disconnect minecraft.DisconnectError
+		if errors.As(result.err, &disconnect) {
+			log.Printf("%s relay ended for %s after %s: upstream disconnected: %s", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second), disconnect)
+			_ = listener.Disconnect(conn, disconnect.Error())
+		} else {
+			log.Printf("%s relay ended for %s after %s: %v", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second), result.err)
+			_ = listener.Disconnect(conn, "The connection to the destination server was interrupted.")
+		}
+	} else {
+		log.Printf("%s relay ended for %s after %s", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second))
+		_ = listener.Disconnect(conn, "Connection closed.")
+	}
 	_ = conn.Close()
 	_ = remote.Close()
 	<-done
+}
+
+type relayResult struct {
+	direction string
+	err       error
 }
 
 func init() {
