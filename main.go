@@ -1,22 +1,17 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"io"
-	"io/fs"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
@@ -32,27 +27,71 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+func executableDir() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
+	}
+	return "."
+}
+
+func resolveResourcePackDir() string {
+	dir := env("RESOURCE_PACK_DIR", "resource_packs")
+	if filepath.IsAbs(dir) {
+		return dir
+	}
+	return filepath.Join(executableDir(), dir)
+}
+
+func discoverPacks(dir string) []*resource.Pack {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("resource pack dir: create %s: %v", dir, err)
+		return nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("resource pack dir: read %s: %v", dir, err)
+		return nil
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.ToLower(entry.Name())
+		if strings.HasSuffix(name, ".mcpack") || strings.HasSuffix(name, ".zip") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+
+	packs := make([]*resource.Pack, 0, len(paths))
+	for _, path := range paths {
+		pack, err := resource.ReadPath(path)
+		if err != nil {
+			log.Printf("resource pack load failed: %s (%v)", path, err)
+			continue
+		}
+		packs = append(packs, pack)
+		log.Printf("loaded resource pack: %s (%s v%s)", pack.Name(), pack.UUID(), pack.Version())
+	}
+	return packs
+}
+
 func main() {
 	listenAddr := env("LISTEN_ADDR", "0.0.0.0:25665")
 	remoteAddr := env("REMOTE_ADDR", "donutsmp.net:19132")
-	resourceDir := env("RESOURCE_PACK_DIR", "resource_packs")
-
-	// Ensure resource directory exists (FeatherPanel expects it next to the server binary)
-	if err := os.MkdirAll(resourceDir, 0o755); err != nil {
-		log.Fatalf("create resource pack dir %s: %v", resourceDir, err)
-	}
-
-	// Discover resource packs at startup and register with the listener via resource.Packs
+	resourceDir := resolveResourcePackDir()
 	packs := discoverPacks(resourceDir)
+
 	log.Printf("Nova Bedrock direct proxy")
 	log.Printf("Listening on UDP %s; upstream %s", listenAddr, remoteAddr)
+	log.Printf("Resource pack dir: %s", resourceDir)
 	if len(packs) == 0 {
-		log.Printf("Resource packs: none found in %s; behaving as transparent upstream passthrough.", resourceDir)
+		log.Printf("Resource packs: none discovered. Startup continues with upstream passthrough only.")
 	} else {
-		log.Printf("Resource packs: %d pack(s) discovered in %s", len(packs), resourceDir)
-		for i, p := range packs {
-			log.Printf("  %d: %s (%s) size=%d hash=%s", i+1, p.Name(), p.UUID().String(), p.Len(), hex.EncodeToString(p.Hash()))
-		}
+		log.Printf("Resource packs: %d loaded and ready for Bedrock negotiation.", len(packs))
 	}
 
 	token, err := auth.RequestLiveToken()
@@ -62,14 +101,16 @@ func main() {
 	src := auth.RefreshTokenSource(token)
 
 	status, err := minecraft.NewForeignStatusProvider(remoteAddr)
-	cfg := minecraft.ListenConfig{StatusProvider: status}
-	// Attach discovered resource packs to the listener config so they will be offered to clients.
-	cfg.ResourcePacks = packs
-	listener, err := cfg.Listen("raknet", listenAddr)
 	if err != nil {
 		log.Fatalf("create upstream status provider: %v", err)
 	}
-	listener, err := (minecraft.ListenConfig{StatusProvider: status}).Listen("raknet", listenAddr)
+
+	cfg := minecraft.ListenConfig{
+		StatusProvider:       status,
+		ResourcePacks:        packs,
+		TexturePacksRequired: false,
+	}
+	listener, err := cfg.Listen("raknet", listenAddr)
 	if err != nil {
 		log.Fatalf("listen on %s (check that FeatherPanel allocated UDP): %v", listenAddr, err)
 	}
@@ -167,56 +208,5 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 }
 
 func init() {
-	// Avoid accidentally binding a TCP-only port from a panel allocation.
 	_ = net.IPv4zero
-}
-
-// discoverPacks scans the provided directory for .mcpack files and attempts to load them as resource.Pack
-// values. It returns only successfully loaded packs. Errors are logged but do not stop execution.
-func discoverPacks(dir string) []*resource.Pack {
-	var packs []*resource.Pack
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		log.Printf("discover packs: cannot read dir %s: %v", dir, err)
-		return packs
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".mcpack") && !strings.HasSuffix(strings.ToLower(name), ".zip") {
-			continue
-		}
-		path := filepath.Join(dir, name)
-		f, err := os.Open(path)
-		if err != nil {
-			log.Printf("discover packs: open %s: %v", path, err)
-			continue
-		}
-		// Read entire file to compute hash and pass to resource.Read
-		data, err := io.ReadAll(f)
-		_ = f.Close()
-		if err != nil {
-			log.Printf("discover packs: read %s: %v", path, err)
-			continue
-		}
-		// Compute SHA256
-		h := sha256.Sum256(data)
-		// resource.Read accepts an io.Reader; use bytes.Reader
-		r, err := resource.Read(bytes.NewReader(data))
-		if err != nil {
-			log.Printf("discover packs: invalid resource pack %s: %v", path, err)
-			continue
-		}
-		// If the pack has no UUID, generate one to avoid empty identifiers
-		if r.UUID().String() == uuid.Nil.String() {
-			newUUID := uuid.New()
-			r = r.WithUUID(newUUID)
-		}
-		// some gophertunnel resource.Pack types expose Hash/Len/Name; adapt as available
-		packs = append(packs, r)
-		log.Printf("discover packs: loaded %s uuid=%s size=%d hash=%s", name, r.UUID().String(), r.Len(), hex.EncodeToString(h[:]))
-	}
-	return packs
 }
