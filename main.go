@@ -170,3 +170,53 @@ func init() {
 	// Avoid accidentally binding a TCP-only port from a panel allocation.
 	_ = net.IPv4zero
 }
+
+// discoverPacks scans the provided directory for .mcpack files and attempts to load them as resource.Pack
+// values. It returns only successfully loaded packs. Errors are logged but do not stop execution.
+func discoverPacks(dir string) []*resource.Pack {
+	var packs []*resource.Pack
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("discover packs: cannot read dir %s: %v", dir, err)
+		return packs
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".mcpack") && !strings.HasSuffix(strings.ToLower(name), ".zip") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		f, err := os.Open(path)
+		if err != nil {
+			log.Printf("discover packs: open %s: %v", path, err)
+			continue
+		}
+		// Read entire file to compute hash and pass to resource.Read
+		data, err := io.ReadAll(f)
+		_ = f.Close()
+		if err != nil {
+			log.Printf("discover packs: read %s: %v", path, err)
+			continue
+		}
+		// Compute SHA256
+		h := sha256.Sum256(data)
+		// resource.Read accepts an io.Reader; use bytes.Reader
+		r, err := resource.Read(bytes.NewReader(data))
+		if err != nil {
+			log.Printf("discover packs: invalid resource pack %s: %v", path, err)
+			continue
+		}
+		// If the pack has no UUID, generate one to avoid empty identifiers
+		if r.UUID().String() == uuid.Nil.String() {
+			newUUID := uuid.New()
+			r = r.WithUUID(newUUID)
+		}
+		// some gophertunnel resource.Pack types expose Hash/Len/Name; adapt as available
+		packs = append(packs, r)
+		log.Printf("discover packs: loaded %s uuid=%s size=%d hash=%s", name, r.UUID().String(), r.Len(), hex.EncodeToString(h[:]))
+	}
+	return packs
+}
