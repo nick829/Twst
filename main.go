@@ -9,12 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"golang.org/x/oauth2"
 )
@@ -84,17 +86,43 @@ func discoverPacks(dir string) []*resource.Pack {
 func main() {
 	listenAddr := env("LISTEN_ADDR", "0.0.0.0:25665")
 	remoteAddr := env("REMOTE_ADDR", "donutsmp.net:19132")
+	commandPrefix := env("COMMAND_PREFIX", ".")
+	if strings.TrimSpace(commandPrefix) == "" || strings.ContainsAny(commandPrefix, " \t\r\n") {
+		log.Fatal("COMMAND_PREFIX must be non-empty and contain no whitespace")
+	}
+	forwardUnknownCommands, err := strconv.ParseBool(env("FORWARD_UNKNOWN_PREFIX_COMMANDS", "true"))
+	if err != nil {
+		log.Fatalf("invalid FORWARD_UNKNOWN_PREFIX_COMMANDS value: %v", err)
+	}
+	scannerEnabled, err := strconv.ParseBool(env("SCANNER_ENABLED", "true"))
+	if err != nil {
+		log.Fatalf("invalid SCANNER_ENABLED value: %v", err)
+	}
+	scannerCacheLimit, err := strconv.Atoi(env("SCANNER_CACHE_LIMIT", "256"))
+	if err != nil {
+		log.Fatalf("invalid SCANNER_CACHE_LIMIT value: %v", err)
+	}
+	diagnostics, err := newDiagnosticsTracker(scannerEnabled, scannerCacheLimit)
+	if err != nil {
+		log.Fatalf("configure scanner diagnostics: %v", err)
+	}
 	resourceDir := resolveResourcePackDir()
 	packs := discoverPacks(resourceDir)
+	commands, err := newCommandEngine(commandPrefix, forwardUnknownCommands, listenAddr, remoteAddr, packs, diagnostics)
+	if err != nil {
+		log.Fatalf("configure chat commands: %v", err)
+	}
 
 	log.Printf("Nova Bedrock direct proxy")
 	log.Printf("Listening on UDP %s; upstream %s", listenAddr, remoteAddr)
 	log.Printf("Resource pack dir: %s", resourceDir)
+	log.Printf("Scanner diagnostics: enabled=%t; metadata cache limit=%d", scannerEnabled, scannerCacheLimit)
 	if len(packs) == 0 {
 		log.Printf("Resource packs: none discovered. Startup continues with upstream passthrough only.")
 	} else {
 		log.Printf("Resource packs: %d loaded and ready for Bedrock negotiation.", len(packs))
 	}
+	go runConsoleCommands(os.Stdin, os.Stdout, commands, active.Load)
 
 	token, err := auth.RequestLiveToken()
 	if err != nil {
@@ -132,11 +160,11 @@ func main() {
 			_ = c.Close()
 			continue
 		}
-		go handleConn(conn, listener, remoteAddr, src)
+		go handleConn(conn, listener, remoteAddr, src, commands, diagnostics)
 	}
 }
 
-func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr string, src oauth2.TokenSource) {
+func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr string, src oauth2.TokenSource, commands *commandEngine, diagnostics *diagnosticsTracker) {
 	active.Add(1)
 	defer active.Add(-1)
 
@@ -184,6 +212,18 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 				relayErr = err
 				break
 			}
+			diagnostics.observe("client->upstream", pk)
+			if text, ok := pk.(*packet.Text); ok && text.TextType == packet.TextTypeChat {
+				if response, handled := commands.handle(text.Message, active.Load()); handled {
+					if response != "" {
+						if err := writeCommandResponse(conn, response); err != nil {
+							relayErr = err
+							break
+						}
+					}
+					continue
+				}
+			}
 			if err := remote.WritePacket(pk); err != nil {
 				relayErr = err
 				break
@@ -199,6 +239,7 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 				relayErr = err
 				break
 			}
+			diagnostics.observe("upstream->client", pk)
 			if err := conn.WritePacket(pk); err != nil {
 				relayErr = err
 				break
