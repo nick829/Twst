@@ -1,16 +1,25 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
+	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"golang.org/x/oauth2"
 )
 
@@ -24,11 +33,27 @@ func env(key, fallback string) string {
 }
 
 func main() {
-	listenAddr := env("LISTEN_ADDR", "0.0.0.0:19132")
+	listenAddr := env("LISTEN_ADDR", "0.0.0.0:25665")
 	remoteAddr := env("REMOTE_ADDR", "donutsmp.net:19132")
+	resourceDir := env("RESOURCE_PACK_DIR", "resource_packs")
+
+	// Ensure resource directory exists (FeatherPanel expects it next to the server binary)
+	if err := os.MkdirAll(resourceDir, 0o755); err != nil {
+		log.Fatalf("create resource pack dir %s: %v", resourceDir, err)
+	}
+
+	// Discover resource packs at startup and register with the listener via resource.Packs
+	packs := discoverPacks(resourceDir)
 	log.Printf("Nova Bedrock direct proxy")
 	log.Printf("Listening on UDP %s; upstream %s", listenAddr, remoteAddr)
-	log.Printf("Resource packs: transparent upstream passthrough only; custom uploaded packs are NOT injected.")
+	if len(packs) == 0 {
+		log.Printf("Resource packs: none found in %s; behaving as transparent upstream passthrough.", resourceDir)
+	} else {
+		log.Printf("Resource packs: %d pack(s) discovered in %s", len(packs), resourceDir)
+		for i, p := range packs {
+			log.Printf("  %d: %s (%s) size=%d hash=%s", i+1, p.Name(), p.UUID().String(), p.Len(), hex.EncodeToString(p.Hash()))
+		}
+	}
 
 	token, err := auth.RequestLiveToken()
 	if err != nil {
@@ -37,6 +62,10 @@ func main() {
 	src := auth.RefreshTokenSource(token)
 
 	status, err := minecraft.NewForeignStatusProvider(remoteAddr)
+	cfg := minecraft.ListenConfig{StatusProvider: status}
+	// Attach discovered resource packs to the listener config so they will be offered to clients.
+	cfg.ResourcePacks = packs
+	listener, err := cfg.Listen("raknet", listenAddr)
 	if err != nil {
 		log.Fatalf("create upstream status provider: %v", err)
 	}
