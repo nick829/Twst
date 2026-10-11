@@ -1,0 +1,51 @@
+name: Build NovaBedrockProxy Linux AMD64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'Go files need formatting:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build Linux AMD64 executable
+        run: env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o server .
+
+      - name: Verify executable
+        run: |
+          test -s server
+          file server
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: NovaBedrockProxy-Linux-AMD64
+          path: server
+          if-no-files-found: error
