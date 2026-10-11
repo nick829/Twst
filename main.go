@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 )
 
 var active atomic.Int64
+var protocolLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -106,9 +108,10 @@ func main() {
 	}
 
 	cfg := minecraft.ListenConfig{
+		ErrorLog:             protocolLogger,
 		StatusProvider:       status,
 		ResourcePacks:        packs,
-		TexturePacksRequired: false,
+		TexturePacksRequired: len(packs) > 0,
 	}
 	listener, err := cfg.Listen("raknet", listenAddr)
 	if err != nil {
@@ -138,6 +141,7 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 	defer active.Add(-1)
 
 	remote, err := (minecraft.Dialer{
+		ErrorLog:    protocolLogger,
 		TokenSource: src,
 		ClientData:  conn.ClientData(),
 	}).Dial("raknet", remoteAddr)
