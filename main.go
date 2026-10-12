@@ -150,8 +150,10 @@ func run() error {
 	log.Printf("Listening address: UDP %s; upstream address: %s", listenAddr, remoteAddr)
 	log.Printf("Resource pack directory: %s; loaded packs: %d", resourceDir, len(packs))
 	log.Printf("Microsoft/Xbox authentication: loading persistent credentials")
+	authTokenPath := resolveAuthTokenPath()
+	log.Printf("Microsoft/Xbox authentication file: %s", authTokenPath)
 	log.Printf("Scanner diagnostics: enabled=%t; metadata cache limit=%d", scannerEnabled, scannerCacheLimit)
-	tokenSource, err := loadAuthentication(ctx, resolveAuthTokenPath())
+	tokenSource, err := loadAuthentication(ctx, authTokenPath)
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return nil
