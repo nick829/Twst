@@ -11,7 +11,7 @@ func testCommandEngine(t *testing.T, forwardUnknown bool) *commandEngine {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := newCommandEngine(".", forwardUnknown, "0.0.0.0:25665", "donutsmp.net:19132", nil, diagnostics)
+	engine, err := newCommandEngine(".", forwardUnknown, "0.0.0.0:25665", "play.lbsg.net:19132", nil, diagnostics)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestCommandEngineHandlesSafeCommandsLocally(t *testing.T) {
 		{message: ".help all", contains: ".packstatus"},
 		{message: ".help esp", contains: "No available proxy command"},
 		{message: ".packs", contains: "No valid local resource packs"},
-		{message: ".proxyinfo", contains: "donutsmp.net:19132"},
+		{message: ".proxyinfo", contains: "play.lbsg.net:19132"},
 	}
 	for _, test := range tests {
 		t.Run(test.message, func(t *testing.T) {

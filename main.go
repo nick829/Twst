@@ -113,7 +113,7 @@ func main() {
 
 func run() error {
 	listenAddr := env("LISTEN_ADDR", "0.0.0.0:25665")
-	remoteAddr := env("REMOTE_ADDR", "summitsurvival.org:63809")
+	remoteAddr := env("REMOTE_ADDR", "play.lbsg.net:19132")
 	if _, _, err := splitHostPort(remoteAddr); err != nil {
 		return fmt.Errorf("invalid REMOTE_ADDR: %w", err)
 	}

@@ -20,7 +20,7 @@ The workflow only creates a downloadable artifact; it does not deploy or replace
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LISTEN_ADDR` | `0.0.0.0:25665` | Local Bedrock UDP listen address. Set the port to FeatherPanel's allocated UDP port. |
-| `REMOTE_ADDR` | `summitsurvival.org:63809` | Upstream Bedrock server as `host:port`. Set this in FeatherPanel to change the destination. |
+| `REMOTE_ADDR` | `play.lbsg.net:19132` | Lifeboat Bedrock server as `host:port`. Set this in FeatherPanel Startup Variables to change the destination. |
 | `RESOURCE_PACK_DIR` | `resource_packs` | Pack directory relative to the executable, or an absolute path. |
 | `AUTH_TOKEN_FILE` | `.novabedrock-auth.json` | Persistent Microsoft/Xbox token file relative to the executable, or an absolute path. |
 | `COMMAND_PREFIX` | `.` | Prefix for local proxy chat commands. |
