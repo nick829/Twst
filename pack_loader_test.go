@@ -58,7 +58,7 @@ func TestDiscoverPacksEmptyDirectory(t *testing.T) {
 func TestDiscoverPacksLoadsValidAndSkipsInvalid(t *testing.T) {
 	dir := t.TempDir()
 	writeTestPack(t, dir, "pack-one.mcpack", "Pack One", "11111111-1111-1111-1111-111111111111")
-	writeTestPack(t, dir, "pack-two.MCPACK", "Pack Two", "22222222-2222-2222-2222-222222222222")
+	writeTestPack(t, dir, "pack-two.ZIP", "Pack Two", "22222222-2222-2222-2222-222222222222")
 	if err := os.WriteFile(filepath.Join(dir, "bad.mcpack"), []byte("not a zip archive"), 0o600); err != nil {
 		t.Fatalf("write invalid pack: %v", err)
 	}

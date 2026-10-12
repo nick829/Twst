@@ -1,45 +1,43 @@
-# Nova Bedrock Proxy (Go)
+# Nova Bedrock Proxy
 
-This is a Go source project for a Bedrock protocol proxy using Gophertunnel. This archive includes a non-root Go bootstrap for Debian-based containers that do not have Go preinstalled.
+NovaBedrockProxy is a Bedrock Edition proxy using Gophertunnel over RakNet/UDP. FeatherPanel runs the prebuilt Linux AMD64 executable; Go is needed only to build the project, not on the game server.
 
-## Prebuilt Linux AMD64 executable
+## FeatherPanel setup
 
-The repository's GitHub Actions workflow builds the real Go application when manually run or when code is pushed to `main`. To download it, open the successful workflow run on GitHub, select the `NovaBedrockProxy-Linux-AMD64` artifact, and upload the extracted `server` file to the FeatherPanel server root (usually `/home/container`).
+1. Download the `NovaBedrockProxy-Linux-AMD64` artifact from a successful run of the `Build NovaBedrockProxy` GitHub Actions workflow.
+2. Extract and upload the executable named `server` to `/home/container`, replacing the existing `server`.
+3. Allocate a UDP port in FeatherPanel and configure the Startup Variables below.
+4. Use this exact Startup Command:
 
-Use this FeatherPanel Startup Command to launch the uploaded executable directly:
+   ```sh
+   chmod +x ./server && exec ./server
+   ```
 
-```sh
-chmod +x /home/container/server && exec /home/container/server
-```
+The workflow only creates a downloadable artifact; it does not deploy or replace files in FeatherPanel automatically. After a later build, download the new artifact and manually replace `/home/container/server`.
 
-Set `LISTEN_ADDR` to `0.0.0.0:<allocated-UDP-port>` and `REMOTE_ADDR` to `<destination-host>:<destination-port>` as needed. Defaults are `0.0.0.0:19132` and `donutsmp.net:19132`, respectively. The listen port must be allocated as UDP in FeatherPanel. On startup, Microsoft device authentication prints a URL and code in the server console; complete that sign-in flow when prompted.
+## Startup Variables
 
-## For `ghcr.io/ptero-eggs/yolks:debian`
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LISTEN_ADDR` | `0.0.0.0:25665` | Local Bedrock UDP listen address. Set the port to FeatherPanel's allocated UDP port. |
+| `REMOTE_ADDR` | `summitsurvival.org:63809` | Upstream Bedrock server as `host:port`. Set this in FeatherPanel to change the destination. |
+| `RESOURCE_PACK_DIR` | `resource_packs` | Pack directory relative to the executable, or an absolute path. |
+| `AUTH_TOKEN_FILE` | `.novabedrock-auth.json` | Persistent Microsoft/Xbox token file relative to the executable, or an absolute path. |
+| `COMMAND_PREFIX` | `.` | Prefix for local proxy chat commands. |
+| `FORWARD_UNKNOWN_PREFIX_COMMANDS` | `true` | Forward unrecognized prefix commands to the upstream server. |
+| `SCANNER_ENABLED` | `true` | Enable bounded packet metadata diagnostics. |
+| `SCANNER_CACHE_LIMIT` | `256` | Recent scanner entries to retain, from `0` to `4096`. |
 
-The Debian image does not necessarily include Go. Do not use `go build ...` directly until Go has been installed.
+The default pack directory resolves next to `server`, which is `/home/container/resource_packs` in the normal FeatherPanel layout. The proxy creates it on startup. Place any number of valid `.mcpack` or supported `.zip` resource packs there; valid packs are offered to connecting Bedrock clients through Gophertunnel. Invalid packs are logged and skipped. Packs are discovered again each time the proxy starts. If there are no valid packs, normal proxy operation continues without requiring packs.
 
-1. Upload/extract this folder so `go.mod`, `main.go`, `install-go.sh`, and `start.sh` are in the server working directory (commonly `/home/container`).
-2. Ensure `curl` and `tar` exist in the Debian image. The installer does not use `apt-get` or require root.
-3. Run `bash ./install-go.sh` once from the Script Install process. It downloads Go 1.25.0 into `.tools/go`, downloads module dependencies, and builds `./server`.
-4. Set Startup Command to `bash ./start.sh`.
-5. Set Go Package to `.` if the egg requires it. The executable setting is not used by `start.sh`, because the script builds and launches `./server` itself.
-6. Set environment variables if the panel supports them:
-   - `LISTEN_ADDR=0.0.0.0:25649`
-   - `REMOTE_ADDR=donutsmp.net:19132`
-7. Ensure the allocated port is UDP; Bedrock uses UDP.
+The first run prints a Microsoft device-code sign-in prompt in the server console. The resulting refresh token is persisted locally with owner-only file permissions and reused/refreshed on later runs. Do not share `.novabedrock-auth.json` or upload it as an artifact. If Microsoft/Xbox credentials have expired or been revoked, the proxy reports that a new device-code sign-in is needed. The default token file is ignored by Git.
 
-If Script Install cannot run shell scripts from the server directory, use its command field to run `bash ./install-go.sh` or paste that command into the install step. Do not enable privileged scripts just to install Go.
+The proxy resolves the upstream hostname for each incoming player connection. DNS failures, UDP timeouts, and refused/rejected UDP connections are reported separately; a temporary upstream outage does not stop the listener. Logs do not include player IP addresses or authentication tokens. SIGTERM and Ctrl-C stop accepting players and close active relay connections.
 
-## Scanner packet diagnostics
+The destination address is configurable; this project does not claim that a particular upstream server supports proxy connections.
 
-The proxy provides `.scanner` and `.scanner status` in Minecraft chat and the FeatherPanel server console. Use `.scanner reset` to clear the in-memory counters and recent metadata cache. Console commands accept either `scanner status` or `.scanner status`. Chat commands recognized by the proxy are handled locally and are not forwarded upstream; ordinary chat and unrelated packets continue through the existing relay.
+## Existing proxy commands
 
-`SCANNER_ENABLED` defaults to `true`. Set it to `false` to disable packet tracking. `SCANNER_CACHE_LIMIT` defaults to `256` and accepts values from `0` to `4096`; `0` retains counters but no recent-event history. The cache stores a bounded number of packet-type/direction records and limited `LevelChunk` metadata such as sub-chunk count, serialized payload size, and cache mode.
+Use `.help` in Bedrock chat or `help` in the FeatherPanel console to list local commands. `.packstatus` reports packs offered by this proxy, `.proxyinfo` reports the configured addresses and current connection count, and `.scanner status` / `.scanner reset` manage the existing bounded packet diagnostics.
 
-Diagnostics count only `LevelChunk`, `UpdateBlock`, `PlayerAuthInput`, and `MovePlayer` packets observed on active proxy connections. They do not decode chunk payloads or block palettes, retain block/player coordinates, identify hidden blocks, or inspect data the upstream server has not sent to a connected player. This is packet-level diagnostics, not an X-ray or complete world scanner.
-
-## Important limitations
-
-- A successful compile does not verify connectivity or authentication in your FeatherPanel instance; check its logs if startup or upstream login fails.
-- If the Debian image lacks `curl` or `tar`, the installer will fail; use an image with these tools or ask the panel administrator to include them.
-- The proxy does not inject arbitrary uploaded resource packs into a third-party server. The destination server controls its resource-pack negotiation.
+Scanner diagnostics count only `LevelChunk`, `UpdateBlock`, `PlayerAuthInput`, and `MovePlayer` packets observed on active proxy connections. They do not decode chunk payloads, retain positions or block identifiers, or inspect data the upstream server has not sent to a connected player.

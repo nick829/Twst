@@ -1,10 +1,10 @@
-name: Build NovaBedrockProxy Linux AMD64
+name: Build NovaBedrockProxy
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -49,3 +49,11 @@ jobs:
           name: NovaBedrockProxy-Linux-AMD64
           path: server
           if-no-files-found: error
+
+      - name: Explain FeatherPanel update
+        run: |
+          {
+            echo '### FeatherPanel deployment'
+            echo 'Download the `NovaBedrockProxy-Linux-AMD64` artifact, extract `server`, and manually replace `/home/container/server` in FeatherPanel.'
+            echo 'This workflow does not deploy the executable to FeatherPanel automatically.'
+          } >> "$GITHUB_STEP_SUMMARY"

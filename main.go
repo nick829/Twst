@@ -3,19 +3,22 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sandertv/gophertunnel/minecraft"
-	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"golang.org/x/oauth2"
@@ -23,6 +26,9 @@ import (
 
 var active atomic.Int64
 var protocolLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+const upstreamDialTimeout = 20 * time.Second
+const upstreamResolveTimeout = 5 * time.Second
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -39,22 +45,30 @@ func executableDir() string {
 }
 
 func resolveResourcePackDir() string {
-	dir := env("RESOURCE_PACK_DIR", "resource_packs")
+	dir := env("RESOURCE_PACK_DIR", filepath.Join(executableDir(), "resource_packs"))
 	if filepath.IsAbs(dir) {
 		return dir
 	}
 	return filepath.Join(executableDir(), dir)
 }
 
+func resolveAuthTokenPath() string {
+	path := env("AUTH_TOKEN_FILE", ".novabedrock-auth.json")
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(executableDir(), path)
+}
+
 func discoverPacks(dir string) []*resource.Pack {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Printf("resource pack dir: create %s: %v", dir, err)
+		log.Printf("resource pack directory creation failed: %v", err)
 		return nil
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		log.Printf("resource pack dir: read %s: %v", dir, err)
+		log.Printf("resource pack directory read failed: %v", err)
 		return nil
 	}
 
@@ -71,87 +85,107 @@ func discoverPacks(dir string) []*resource.Pack {
 	sort.Strings(paths)
 
 	packs := make([]*resource.Pack, 0, len(paths))
+	seenUUIDs := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
 		pack, err := resource.ReadPath(path)
 		if err != nil {
-			log.Printf("resource pack load failed: %s (%v)", path, err)
+			log.Printf("resource pack load failed for %s: %v", filepath.Base(path), err)
 			continue
 		}
+		uuid := pack.UUID().String()
+		if _, ok := seenUUIDs[uuid]; ok {
+			log.Printf("resource pack load failed for %s: duplicate pack UUID %s", filepath.Base(path), uuid)
+			continue
+		}
+		seenUUIDs[uuid] = struct{}{}
 		packs = append(packs, pack)
-		log.Printf("loaded resource pack: %s (%s v%s)", pack.Name(), pack.UUID(), pack.Version())
+		log.Printf("loaded resource pack: %s (%s v%s)", pack.Name(), uuid, pack.Version())
 	}
 	return packs
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("proxy stopped: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	listenAddr := env("LISTEN_ADDR", "0.0.0.0:25665")
-	remoteAddr := env("REMOTE_ADDR", "donutsmp.net:19132")
+	remoteAddr := env("REMOTE_ADDR", "summitsurvival.org:63809")
+	if _, _, err := splitHostPort(remoteAddr); err != nil {
+		return fmt.Errorf("invalid REMOTE_ADDR: %w", err)
+	}
 	commandPrefix := env("COMMAND_PREFIX", ".")
 	if strings.TrimSpace(commandPrefix) == "" || strings.ContainsAny(commandPrefix, " \t\r\n") {
-		log.Fatal("COMMAND_PREFIX must be non-empty and contain no whitespace")
+		return errors.New("COMMAND_PREFIX must be non-empty and contain no whitespace")
 	}
 	forwardUnknownCommands, err := strconv.ParseBool(env("FORWARD_UNKNOWN_PREFIX_COMMANDS", "true"))
 	if err != nil {
-		log.Fatalf("invalid FORWARD_UNKNOWN_PREFIX_COMMANDS value: %v", err)
+		return fmt.Errorf("invalid FORWARD_UNKNOWN_PREFIX_COMMANDS value: %w", err)
 	}
 	scannerEnabled, err := strconv.ParseBool(env("SCANNER_ENABLED", "true"))
 	if err != nil {
-		log.Fatalf("invalid SCANNER_ENABLED value: %v", err)
+		return fmt.Errorf("invalid SCANNER_ENABLED value: %w", err)
 	}
 	scannerCacheLimit, err := strconv.Atoi(env("SCANNER_CACHE_LIMIT", "256"))
 	if err != nil {
-		log.Fatalf("invalid SCANNER_CACHE_LIMIT value: %v", err)
+		return fmt.Errorf("invalid SCANNER_CACHE_LIMIT value: %w", err)
 	}
 	diagnostics, err := newDiagnosticsTracker(scannerEnabled, scannerCacheLimit)
 	if err != nil {
-		log.Fatalf("configure scanner diagnostics: %v", err)
+		return fmt.Errorf("configure scanner diagnostics: %w", err)
 	}
 	resourceDir := resolveResourcePackDir()
 	packs := discoverPacks(resourceDir)
 	commands, err := newCommandEngine(commandPrefix, forwardUnknownCommands, listenAddr, remoteAddr, packs, diagnostics)
 	if err != nil {
-		log.Fatalf("configure chat commands: %v", err)
+		return fmt.Errorf("configure chat commands: %w", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	log.Printf("Nova Bedrock direct proxy")
-	log.Printf("Listening on UDP %s; upstream %s", listenAddr, remoteAddr)
-	log.Printf("Resource pack dir: %s", resourceDir)
+	log.Printf("Listening address: UDP %s; upstream address: %s", listenAddr, remoteAddr)
+	log.Printf("Resource pack directory: %s; loaded packs: %d", resourceDir, len(packs))
+	log.Printf("Microsoft/Xbox authentication: loading persistent credentials")
 	log.Printf("Scanner diagnostics: enabled=%t; metadata cache limit=%d", scannerEnabled, scannerCacheLimit)
-	if len(packs) == 0 {
-		log.Printf("Resource packs: none discovered. Startup continues with upstream passthrough only.")
-	} else {
-		log.Printf("Resource packs: %d loaded and ready for Bedrock negotiation.", len(packs))
-	}
-	go runConsoleCommands(os.Stdin, os.Stdout, commands, active.Load)
-
-	token, err := auth.RequestLiveToken()
+	tokenSource, err := loadAuthentication(ctx, resolveAuthTokenPath())
 	if err != nil {
-		log.Fatalf("Microsoft/Xbox authentication setup failed: %v", err)
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return nil
+		}
+		return err
 	}
-	src := auth.RefreshTokenSource(token)
-
-	status, err := minecraft.NewForeignStatusProvider(remoteAddr)
-	if err != nil {
-		log.Fatalf("create upstream status provider: %v", err)
-	}
+	log.Printf("Microsoft/Xbox authentication: ready (persistent token storage enabled)")
 
 	cfg := minecraft.ListenConfig{
 		ErrorLog:             protocolLogger,
-		StatusProvider:       status,
+		StatusProvider:       minecraft.NewStatusProvider("Nova Bedrock Proxy", "Nova Bedrock Proxy"),
 		ResourcePacks:        packs,
 		TexturePacksRequired: len(packs) > 0,
 	}
 	listener, err := cfg.Listen("raknet", listenAddr)
 	if err != nil {
-		log.Fatalf("listen on %s (check that FeatherPanel allocated UDP): %v", listenAddr, err)
+		return fmt.Errorf("listen on UDP %s (check that FeatherPanel allocated this UDP port): %w", listenAddr, err)
 	}
 	defer listener.Close()
+	log.Printf("Proxy is listening on %s.", listener.Addr())
+	go runConsoleCommands(os.Stdin, os.Stdout, commands, active.Load)
 
-	log.Printf("Proxy is listening. Add the allocated public IP and UDP port to Bedrock.")
+	var connections sync.WaitGroup
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
 	for {
 		c, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			if ctx.Err() != nil {
+				break
+			}
+			log.Printf("accept incoming connection failed: %v", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -160,28 +194,112 @@ func main() {
 			_ = c.Close()
 			continue
 		}
-		go handleConn(conn, listener, remoteAddr, src, commands, diagnostics)
+		connections.Add(1)
+		go func() {
+			defer connections.Done()
+			handleConn(ctx, conn, listener, remoteAddr, tokenSource, commands, diagnostics)
+		}()
 	}
+	connections.Wait()
+	log.Printf("Proxy shutdown complete.")
+	return nil
 }
 
-func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr string, src oauth2.TokenSource, commands *commandEngine, diagnostics *diagnosticsTracker) {
+func splitHostPort(address string) (string, string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", "", fmt.Errorf("expected host:port: %w", err)
+	}
+	if host == "" {
+		return "", "", errors.New("host must not be empty")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", errors.New("port must be a number between 1 and 65535")
+	}
+	return host, port, nil
+}
+
+func dialUpstream(ctx context.Context, dialer minecraft.Dialer, address string) (*minecraft.Conn, error) {
+	host, port, err := splitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid upstream address: %w", err)
+	}
+	resolveCtx, cancelResolve := context.WithTimeout(ctx, upstreamResolveTimeout)
+	ips, err := net.DefaultResolver.LookupIPAddr(resolveCtx, host)
+	cancelResolve()
+	if err != nil {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) || net.ParseIP(host) == nil {
+			return nil, fmt.Errorf("DNS resolution failed for upstream host %q: %w", host, err)
+		}
+		return nil, fmt.Errorf("resolve upstream host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("DNS resolution failed for upstream host %q: no addresses returned", host)
+	}
+
+	var lastErr error
+	for _, ip := range ips {
+		dialCtx, cancelDial := context.WithTimeout(ctx, upstreamDialTimeout)
+		conn, dialErr := dialer.DialContext(dialCtx, "raknet", net.JoinHostPort(ip.String(), port))
+		cancelDial()
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	var upstreamDisconnect minecraft.DisconnectError
+	if isConnectionRefused(lastErr) || errors.As(lastErr, &upstreamDisconnect) {
+		return nil, fmt.Errorf("upstream UDP connection was refused or rejected: %w", lastErr)
+	}
+	if isTimeout(lastErr) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("upstream UDP connection timed out: %w", lastErr)
+	}
+	if lastErr == nil && ctx.Err() != nil {
+		return nil, fmt.Errorf("upstream connection canceled: %w", ctx.Err())
+	}
+	return nil, fmt.Errorf("upstream UDP connection failed: %w", lastErr)
+}
+
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+func handleConn(ctx context.Context, conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr string, src oauth2.TokenSource, commands *commandEngine, diagnostics *diagnosticsTracker) {
 	active.Add(1)
 	defer active.Add(-1)
-
-	remote, err := (minecraft.Dialer{
+	playerName := conn.IdentityData().DisplayName
+	if playerName == "" {
+		playerName = "unnamed player"
+	}
+	dialCtx, cancelDial := context.WithTimeout(ctx, upstreamDialTimeout+upstreamResolveTimeout)
+	remote, err := dialUpstream(dialCtx, minecraft.Dialer{
 		ErrorLog:    protocolLogger,
 		TokenSource: src,
 		ClientData:  conn.ClientData(),
-	}).Dial("raknet", remoteAddr)
+	}, remoteAddr)
+	cancelDial()
 	if err != nil {
-		log.Printf("upstream dial failed for %s: %v", conn.RemoteAddr(), err)
+		log.Printf("upstream connection failed for %s: %v", playerName, err)
 		_ = listener.Disconnect(conn, "Could not connect to the destination server.")
 		_ = conn.Close()
 		return
 	}
 	defer remote.Close()
 
-	spawnCtx, cancelSpawn := context.WithCancel(context.Background())
+	spawnCtx, cancelSpawn := context.WithCancel(ctx)
 	defer cancelSpawn()
 	spawnErrors := make(chan error, 2)
 	go func() {
@@ -193,7 +311,12 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 	for range 2 {
 		if err := <-spawnErrors; err != nil {
 			cancelSpawn()
-			log.Printf("spawn handshake failed for %s: %v", conn.RemoteAddr(), err)
+			var disconnect minecraft.DisconnectError
+			if errors.As(err, &disconnect) {
+				log.Printf("upstream rejected the connection for %s: %s", playerName, disconnect)
+			} else {
+				log.Printf("spawn handshake failed for %s: %s", playerName, redactPlayerAddress(err, conn.RemoteAddr()))
+			}
 			_ = listener.Disconnect(conn, "Could not complete the connection to the destination server.")
 			_ = remote.Close()
 			return
@@ -201,7 +324,7 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 	}
 
 	connectedAt := time.Now()
-	log.Printf("player %s connected from %s; upstream session established", conn.IdentityData().DisplayName, conn.RemoteAddr())
+	log.Printf("player %s connected; upstream session established", playerName)
 
 	done := make(chan relayResult, 2)
 	go func() {
@@ -248,18 +371,28 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 		done <- relayResult{direction: "upstream-to-client", err: relayErr}
 	}()
 
-	result := <-done
+	var result relayResult
+	select {
+	case result = <-done:
+	case <-ctx.Done():
+		_ = conn.Close()
+		_ = remote.Close()
+		<-done
+		<-done
+		log.Printf("connection for %s closed during proxy shutdown", playerName)
+		return
+	}
 	if result.err != nil {
 		var disconnect minecraft.DisconnectError
 		if errors.As(result.err, &disconnect) {
-			log.Printf("%s relay ended for %s after %s: upstream disconnected: %s", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second), disconnect)
+			log.Printf("%s relay ended for %s after %s: upstream disconnected: %s", result.direction, playerName, time.Since(connectedAt).Round(time.Second), disconnect)
 			_ = listener.Disconnect(conn, disconnect.Error())
 		} else {
-			log.Printf("%s relay ended for %s after %s: %v", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second), result.err)
+			log.Printf("%s relay ended for %s after %s: %s", result.direction, playerName, time.Since(connectedAt).Round(time.Second), redactPlayerAddress(result.err, conn.RemoteAddr()))
 			_ = listener.Disconnect(conn, "The connection to the destination server was interrupted.")
 		}
 	} else {
-		log.Printf("%s relay ended for %s after %s", result.direction, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second))
+		log.Printf("%s relay ended for %s after %s", result.direction, playerName, time.Since(connectedAt).Round(time.Second))
 		_ = listener.Disconnect(conn, "Connection closed.")
 	}
 	_ = conn.Close()
@@ -267,11 +400,15 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, remoteAddr s
 	<-done
 }
 
+func redactPlayerAddress(err error, address net.Addr) string {
+	message := err.Error()
+	if address != nil {
+		message = strings.ReplaceAll(message, address.String(), "[client]")
+	}
+	return message
+}
+
 type relayResult struct {
 	direction string
 	err       error
-}
-
-func init() {
-	_ = net.IPv4zero
 }
